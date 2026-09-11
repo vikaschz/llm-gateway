@@ -1,2 +1,6 @@
 venv
 .env
+gateway.db
+test_groq.py
+__pycache__/
+*.pyc
