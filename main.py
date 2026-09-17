@@ -14,7 +14,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],    
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,6 +39,9 @@ REQ_RATE = 60
 TOK_CAPACITY = 10000
 TOK_RATE = 10000
 
+PROMPT_OVERHEAD_BASE = 66
+PROMPT_OVERHEAD_PER_MESSAGE = 3
+
 
 @app.post("/v1/chat/completions")
 async def chat_completion(request: dict):
@@ -58,12 +61,16 @@ async def chat_completion(request: dict):
 
     joined_text = "\n".join(text)
 
-    prompt_tokens_estimate = len(encoding.encode(joined_text))
+    padding = PROMPT_OVERHEAD_BASE + (PROMPT_OVERHEAD_PER_MESSAGE * len(messages))
+
+    prompt_tokens_estimate = len(encoding.encode(joined_text)) + padding
 
     max_completion_tokens = request.get("max_completion_tokens", 1024)
 
     token_reservation = prompt_tokens_estimate + max_completion_tokens
-    print(f"reservation={token_reservation} prompt_est={prompt_tokens_estimate} max_completion={max_completion_tokens}")
+    print(
+        f"reservation={token_reservation} prompt_est={prompt_tokens_estimate} max_completion={max_completion_tokens}"
+    )
 
     result = rate_limiter(
         keys=[],
