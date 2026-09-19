@@ -12,6 +12,7 @@ class RequestLog(Base):
     completion_tokens = Column(Integer)
     total_tokens = Column(Integer)
     cost = Column(Numeric(10, 6))
+    source = Column(String, default="groq")
 
 
 class SemanticCache(Base):

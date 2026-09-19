@@ -25,8 +25,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # Groq OpenAI-compatible API endpoint
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
 
 # Create database tables if they do not already exist
 Base.metadata.create_all(bind=engine)
@@ -51,7 +53,9 @@ def rebuild_faiss_index():
             if record.embedding is None:
                 continue
 
-            embedding = np.frombuffer(record.embedding, dtype=np.float32)  # type: ignore
+            embedding = np.frombuffer(
+                record.embedding, dtype=np.float32  #type: ignore
+            )  # type: ignore
 
             embeddings.append(embedding)
             cache_ids.append(record.id)
@@ -81,11 +85,14 @@ embedding_dimension = embedding_model.get_embedding_dimension()
 # when embeddings are normalized.
 faiss_index = faiss.IndexFlatIP(embedding_dimension)  # type: ignore
 
+
 # Python list mapping:
 # FAISS vector position -> database/cache ID
 cache_ids = []
 
+
 rebuild_faiss_index()
+
 
 # ---------------------------------------------------------
 # Redis connection
@@ -172,22 +179,29 @@ async def chat_completion(request: dict):
     # ---------------------------------------------------------
     # Semantic cache lookup
     # ---------------------------------------------------------
-    query_vector = embedding_model.encode(joined_text, normalize_embeddings=True)
 
-    # FAISS expects a 2D array, even for a single query
-    query_vector = np.array([query_vector], dtype=np.float32)
+    # Create the embedding ONCE.
+    # This same embedding will be used for:
+    # 1. FAISS lookup
+    # 2. Storing the new cache entry
+    embedding = embedding_model.encode(joined_text, normalize_embeddings=True)
+
+    # FAISS expects a 2D array for a single query
+    query_vector = np.array([embedding], dtype=np.float32)
 
     # Find the nearest cached embedding
     scores, indices = faiss_index.search(query_vector, k=1)
 
     # Similarity threshold for accepting a cache hit
     SIMILARITY_THRESHOLD = 0.85
+    print("FAISS score:", scores[0][0])
+    print("FAISS index size:", faiss_index.ntotal)
 
     if faiss_index.ntotal > 0 and scores[0][0] >= SIMILARITY_THRESHOLD:
         # FAISS returns the position of the matching vector
         index = indices[0][0]
 
-        # Convert FAISS position → database record ID
+        # Convert FAISS position -> database record ID
         cache_id = cache_ids[index]
 
         db = SessionLocal()
@@ -199,11 +213,30 @@ async def chat_completion(request: dict):
             )
 
             if cached_record:
+                cached_data = json.loads(cached_record.response)  # type: ignore
+
+                # Log the cache hit
+                log = RequestLog(
+                    model=cached_data.get("model"),
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_tokens=0,
+                    cost=0,
+                    source="cache",
+                )
+
+                db.add(log)
+                db.commit()
+
                 # Return cached response directly
-                return json.loads(cached_record.response)  # type: ignore
+                return cached_data
 
         finally:
             db.close()
+
+    # ---------------------------------------------------------
+    # Token reservation
+    # ---------------------------------------------------------
 
     # Estimate additional token overhead caused by the
     # chat message structure
@@ -269,16 +302,14 @@ async def chat_completion(request: dict):
     async with httpx.AsyncClient() as client:
 
         response = await client.post(
-            # Groq API endpoint
             GROQ_URL,
-            # Authentication and content headers
             headers=headers,
-            # Forward the original request body
             json=request,
         )
 
         # Convert Groq response into a Python dictionary
         data = response.json()
+
         print("Groq status:", response.status_code)
 
         if response.status_code != 200:
@@ -332,32 +363,39 @@ async def chat_completion(request: dict):
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
                 cost=cost,
+                source="groq",
             )
 
             db.add(log)
             db.commit()
 
+            # -------------------------------------------------
             # Add response to semantic cache
-            # 1. Create embedding for the user's prompt
-            embedding = embedding_model.encode(joined_text, normalize_embeddings=True)
+            # -------------------------------------------------
 
-            # 2. Convert NumPy array to bytes for SQLite
+            # Reuse the embedding created during cache lookup.
+          
+
+            # Convert NumPy array to bytes for SQLite
             embedding_bytes = embedding.astype(np.float32).tobytes()
 
-            # 3. Create cache record
+            # Create cache record
             cache_entry = SemanticCache(
-                prompt=joined_text, embedding=embedding_bytes, response=json.dumps(data)
+                prompt=joined_text,
+                embedding=embedding_bytes,
+                response=json.dumps(data),
             )
 
             db.add(cache_entry)
             db.commit()
             db.refresh(cache_entry)
 
-            # 4. Add embedding to FAISS
+            # Add the same embedding to FAISS
             vector = np.array([embedding], dtype=np.float32)
+
             faiss_index.add(vector)
 
-            # 5. Keep FAISS position → database ID mapping
+            # Keep FAISS position -> database ID mapping
             cache_ids.append(cache_entry.id)
 
         finally:
