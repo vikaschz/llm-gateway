@@ -1,22 +1,71 @@
-from fastapi import FastAPI
-from config import GROQ_API_KEY
-from database import Base, engine
-from models import RequestLog, SemanticCache
-from database import SessionLocal
+from contextlib import asynccontextmanager
+
+import faiss
+import httpx
+import json
+import numpy as np
+import redis
+import tiktoken
+
+from fastapi import FastAPI, Request
 from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sentence_transformers import SentenceTransformer
-import faiss
-import httpx
-import redis
-import tiktoken
-import numpy as np
-import json
 
-app = FastAPI()
+from config import load_api_keys
+from database import Base, engine, SessionLocal
+from key_rotation import seed_and_reconcile
+from models import RequestLog, SemanticCache
+
+# ---------------------------------------------------------
+# Redis connection
+# ---------------------------------------------------------
+
+r = redis.Redis(
+    host="localhost",
+    port=6379,
+    decode_responses=True,
+)
 
 
-# Allow requests from all origins
+# ---------------------------------------------------------
+# FastAPI lifespan
+# ---------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    # Load API key configuration from .env
+    api_key_config = load_api_keys()
+
+    # Initialize and reconcile Redis key-rotation state
+    seed_summary = seed_and_reconcile(
+        r,
+        api_key_config,
+    )
+
+    print("API key rotation initialized:")
+    print(seed_summary)
+
+    # Store configuration on the FastAPI application
+    # so request handlers can access it.
+    app.state.api_key_config = api_key_config
+
+    yield
+
+
+# ---------------------------------------------------------
+# FastAPI application
+# ---------------------------------------------------------
+
+app = FastAPI(lifespan=lifespan)
+
+
+# ---------------------------------------------------------
+# CORS
+# ---------------------------------------------------------
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,12 +75,23 @@ app.add_middleware(
 )
 
 
+# ---------------------------------------------------------
 # Groq OpenAI-compatible API endpoint
+# ---------------------------------------------------------
+
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
-# Create database tables if they do not already exist
+# ---------------------------------------------------------
+# Create database tables
+# ---------------------------------------------------------
+
 Base.metadata.create_all(bind=engine)
+
+
+# ---------------------------------------------------------
+# Semantic cache / FAISS
+# ---------------------------------------------------------
 
 
 def rebuild_faiss_index():
@@ -40,74 +100,70 @@ def rebuild_faiss_index():
     db = SessionLocal()
 
     try:
-        # 1. Load all cached records from the database
+
+        # Load all cached records from the database
         cache_records = db.query(SemanticCache).all()
 
         embeddings = []
         cache_ids = []
 
-        # 2. Read the already-stored embeddings
+        # Read stored embeddings
         for record in cache_records:
 
-            # Skip records that don't have an embedding
+            # Skip records without an embedding
             if record.embedding is None:
                 continue
 
             embedding = np.frombuffer(
-                record.embedding, dtype=np.float32  #type: ignore
-            )  # type: ignore
+                record.embedding,
+                dtype=np.float32,
+            )
 
             embeddings.append(embedding)
             cache_ids.append(record.id)
 
-        # 3. Stack 1D embeddings into a 2D matrix
+        # Stack embeddings into a 2D matrix
         if embeddings:
+
             embedding_matrix = np.vstack(embeddings)
 
-            # 4. Add embeddings to FAISS
+            # Add embeddings to FAISS
             faiss_index.add(embedding_matrix)
 
     finally:
-        # 5. Close the database session
         db.close()
 
 
-# Load the embedding model once when the application starts
+# Load embedding model once
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 
-# Get the embedding dimension from the model
+# Get embedding dimension
 embedding_dimension = embedding_model.get_embedding_dimension()
 
 
-# Create an empty FAISS index
-# IndexFlatIP uses inner product, which we can use for cosine similarity
-# when embeddings are normalized.
-faiss_index = faiss.IndexFlatIP(embedding_dimension)  # type: ignore
+# Create empty FAISS index
+faiss_index = faiss.IndexFlatIP(embedding_dimension)
 
 
-# Python list mapping:
 # FAISS vector position -> database/cache ID
 cache_ids = []
 
 
+# Rebuild FAISS index from SQLite
 rebuild_faiss_index()
 
 
 # ---------------------------------------------------------
-# Redis connection
+# Rate limiter
 # ---------------------------------------------------------
 
-# Connect to Redis running locally
-r = redis.Redis(host="localhost", port=6379, decode_responses=True)
-
-
-# Load the Lua script used for atomic rate limiting
+# Load Lua script used for atomic rate limiting
 with open("rate_limit.lua") as f:
     lua_source = f.read()
 
 
-# Register the Lua script with Redis
+# Register Lua script with Redis
 rate_limiter = r.register_script(lua_source)
 
 
@@ -115,7 +171,6 @@ rate_limiter = r.register_script(lua_source)
 # Token counting configuration
 # ---------------------------------------------------------
 
-# Tokenizer used to estimate prompt tokens
 encoding = tiktoken.get_encoding("o200k_base")
 
 
@@ -123,10 +178,7 @@ encoding = tiktoken.get_encoding("o200k_base")
 # Request rate limit configuration
 # ---------------------------------------------------------
 
-# Maximum number of requests allowed in the bucket
 REQ_CAPACITY = 60
-
-# Request tokens refilled per time window
 REQ_RATE = 60
 
 
@@ -134,10 +186,7 @@ REQ_RATE = 60
 # Token rate limit configuration
 # ---------------------------------------------------------
 
-# Maximum token budget available in the bucket
 TOK_CAPACITY = 10000
-
-# Number of tokens refilled per time window
 TOK_RATE = 10000
 
 
@@ -145,10 +194,7 @@ TOK_RATE = 10000
 # Prompt token overhead
 # ---------------------------------------------------------
 
-# Base overhead added to the estimated prompt tokens
 PROMPT_OVERHEAD_BASE = 66
-
-# Additional overhead added for every message
 PROMPT_OVERHEAD_PER_MESSAGE = 3
 
 
@@ -158,64 +204,97 @@ PROMPT_OVERHEAD_PER_MESSAGE = 3
 
 
 @app.post("/v1/chat/completions")
-async def chat_completion(request: dict):
+async def chat_completion(request: Request):
 
-    # Extract messages from the incoming request
-    messages = request.get("messages", [])
+    body = await request.json()
+
+    # Access FastAPI application state
+    api_key_config = request.app.state.api_key_config
+
+    # -----------------------------------------------------
+    # Extract messages
+    # -----------------------------------------------------
+
+    messages = body.get(
+        "messages",
+        [],
+    )
 
     text = []
 
-    # Extract role and content from every message
     for message in messages:
-        role = message.get("role", "")
-        content = message.get("content", "")
+
+        role = message.get(
+            "role",
+            "",
+        )
+
+        content = message.get(
+            "content",
+            "",
+        )
 
         text.append(role)
         text.append(content)
 
-    # Combine all roles and message contents into one string
     joined_text = "\n".join(text)
 
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
     # Semantic cache lookup
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
 
-    # Create the embedding ONCE.
-    # This same embedding will be used for:
-    # 1. FAISS lookup
-    # 2. Storing the new cache entry
-    embedding = embedding_model.encode(joined_text, normalize_embeddings=True)
+    # Create embedding once.
+    # Reuse it for both FAISS lookup and cache insertion.
+    embedding = embedding_model.encode(
+        joined_text,
+        normalize_embeddings=True,
+    )
 
-    # FAISS expects a 2D array for a single query
-    query_vector = np.array([embedding], dtype=np.float32)
+    # FAISS expects a 2D query vector
+    query_vector = np.array(
+        [embedding],
+        dtype=np.float32,
+    )
 
-    # Find the nearest cached embedding
-    scores, indices = faiss_index.search(query_vector, k=1)
+    # Find nearest cached embedding
+    scores, indices = faiss_index.search(
+        query_vector,
+        k=1,
+    )
 
-    # Similarity threshold for accepting a cache hit
     SIMILARITY_THRESHOLD = 0.85
-    print("FAISS score:", scores[0][0])
-    print("FAISS index size:", faiss_index.ntotal)
+
+    print(
+        "FAISS score:",
+        scores[0][0],
+    )
+
+    print(
+        "FAISS index size:",
+        faiss_index.ntotal,
+    )
 
     if faiss_index.ntotal > 0 and scores[0][0] >= SIMILARITY_THRESHOLD:
-        # FAISS returns the position of the matching vector
+
+        # FAISS position
         index = indices[0][0]
 
-        # Convert FAISS position -> database record ID
+        # FAISS position -> database ID
         cache_id = cache_ids[index]
 
         db = SessionLocal()
 
         try:
-            # Fetch the cached response from SQLite
+
             cached_record = (
                 db.query(SemanticCache).filter(SemanticCache.id == cache_id).first()
             )
 
             if cached_record:
-                cached_data = json.loads(cached_record.response)  # type: ignore
 
-                # Log the cache hit
+                cached_data = json.loads(cached_record.response)
+
+                # Log cache hit
                 log = RequestLog(
                     model=cached_data.get("model"),
                     prompt_tokens=0,
@@ -228,28 +307,24 @@ async def chat_completion(request: dict):
                 db.add(log)
                 db.commit()
 
-                # Return cached response directly
                 return cached_data
 
         finally:
             db.close()
 
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
     # Token reservation
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
 
-    # Estimate additional token overhead caused by the
-    # chat message structure
     padding = PROMPT_OVERHEAD_BASE + (PROMPT_OVERHEAD_PER_MESSAGE * len(messages))
 
-    # Estimate the number of tokens in the prompt
     prompt_tokens_estimate = len(encoding.encode(joined_text)) + padding
 
-    # Get the maximum number of completion tokens requested.
-    # Use 1024 if the client does not provide the value.
-    max_completion_tokens = request.get("max_completion_tokens", 1024)
+    max_completion_tokens = body.get(
+        "max_completion_tokens",
+        1024,
+    )
 
-    # Reserve both prompt tokens and possible completion tokens
     token_reservation = prompt_tokens_estimate + max_completion_tokens
 
     print(
@@ -258,9 +333,9 @@ async def chat_completion(request: dict):
         f"max_completion={max_completion_tokens}"
     )
 
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
     # Atomic Redis rate-limit check
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
 
     result = rate_limiter(
         keys=[],
@@ -274,13 +349,12 @@ async def chat_completion(request: dict):
         ],
     )
 
-    # Extract the result returned by the Lua script
     allowed = int(result[0])
     req_level = result[1]
     tok_level = result[2]
 
-    # Reject the request if either rate limit is exceeded
     if allowed == 0:
+
         raise HTTPException(
             status_code=429,
             detail={
@@ -290,12 +364,34 @@ async def chat_completion(request: dict):
             },
         )
 
-    # ---------------------------------------------------------
+    model = body.get("model")
+
+    if model not in api_key_config.keys_by_model:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Model '{model}' " "is not configured"),
+        )
+
+    key_id = api_key_config.keys_by_model[model][0]
+
+    api_key = api_key_config.keys_by_id.get(key_id)
+
+    if api_key is None:
+
+        raise HTTPException(
+            status_code=503,
+            detail="Configured API key is unavailable",
+        )
+
+    print(f"Using API key: {key_id}")
+
+    # -----------------------------------------------------
     # Groq API request
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
 
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
@@ -304,59 +400,72 @@ async def chat_completion(request: dict):
         response = await client.post(
             GROQ_URL,
             headers=headers,
-            json=request,
+            json=body,
         )
 
-        # Convert Groq response into a Python dictionary
+        # Convert response to dictionary
         data = response.json()
 
-        print("Groq status:", response.status_code)
+        print(
+            "Groq status:",
+            response.status_code,
+        )
 
         if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=data)
 
-        # -----------------------------------------------------
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=data,
+            )
+
+        # -------------------------------------------------
         # Extract actual token usage
-        # -----------------------------------------------------
+        # -------------------------------------------------
 
         prompt_tokens = data["usage"]["prompt_tokens"]
+
         completion_tokens = data["usage"]["completion_tokens"]
+
         total_tokens = data["usage"]["total_tokens"]
+
         model = data["model"]
 
-        # -----------------------------------------------------
+        # -------------------------------------------------
         # Calculate request cost
-        # -----------------------------------------------------
+        # -------------------------------------------------
 
         prompt_price = 0.075 / 1_000_000
+
         completion_price = 0.30 / 1_000_000
 
         cost = prompt_tokens * prompt_price + completion_tokens * completion_price
 
-        # -----------------------------------------------------
-        # Reconcile reserved tokens with actual usage
-        # -----------------------------------------------------
+        # -------------------------------------------------
+        # Reconcile reserved tokens
+        # -------------------------------------------------
 
         actual_total = data["usage"]["total_tokens"]
 
-        # Calculate the difference between the reserved
-        # token amount and the actual token usage
         delta = token_reservation - actual_total
 
         print(f"actual_total={actual_total} " f"delta={delta}")
 
-        # Return unused reserved tokens back to the
-        # Redis token bucket
         if delta != 0:
-            r.hincrby("rate_limit:global", "tok_level", delta)
 
-        # -----------------------------------------------------
-        # Store request information in the database
-        # -----------------------------------------------------
+            r.hincrby(
+                "rate_limit:global",
+                "tok_level",
+                delta,
+            )
+
+        # -------------------------------------------------
+        # Store request information
+        # -------------------------------------------------
 
         db = SessionLocal()
 
         try:
+
             log = RequestLog(
                 model=model,
                 prompt_tokens=prompt_tokens,
@@ -373,13 +482,8 @@ async def chat_completion(request: dict):
             # Add response to semantic cache
             # -------------------------------------------------
 
-            # Reuse the embedding created during cache lookup.
-          
-
-            # Convert NumPy array to bytes for SQLite
             embedding_bytes = embedding.astype(np.float32).tobytes()
 
-            # Create cache record
             cache_entry = SemanticCache(
                 prompt=joined_text,
                 embedding=embedding_bytes,
@@ -390,16 +494,18 @@ async def chat_completion(request: dict):
             db.commit()
             db.refresh(cache_entry)
 
-            # Add the same embedding to FAISS
-            vector = np.array([embedding], dtype=np.float32)
+            # Add embedding to FAISS
+            vector = np.array(
+                [embedding],
+                dtype=np.float32,
+            )
 
             faiss_index.add(vector)
 
-            # Keep FAISS position -> database ID mapping
+            # Maintain FAISS -> database ID mapping
             cache_ids.append(cache_entry.id)
 
         finally:
-            # Always close the database session
             db.close()
 
     return data

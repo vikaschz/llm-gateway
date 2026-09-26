@@ -4,3 +4,6 @@ gateway.db
 test_groq.py
 __pycache__/
 *.pyc
+things.md
+forme.txt
+things
