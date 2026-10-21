@@ -782,29 +782,31 @@ async def chat_completion(request: Request):
                 # Add response to semantic cache
                 # -------------------------------------------------
 
-                embedding_bytes = embedding.astype(np.float32).tobytes()
+                if data["choices"][0].get("finish_reason") == "stop":
 
-                cache_entry = SemanticCache(
-                    prompt=joined_text,
-                    embedding=embedding_bytes,
-                    response=json.dumps(data),
-                )
+                    embedding_bytes = embedding.astype(np.float32).tobytes()
 
-                db.add(cache_entry)
-                db.commit()
+                    cache_entry = SemanticCache(
+                        prompt=joined_text,
+                        embedding=embedding_bytes,
+                        response=json.dumps(data),
+                    )
 
-                db.refresh(cache_entry)
+                    db.add(cache_entry)
+                    db.commit()
 
-                # Add embedding to FAISS
-                vector = np.array(
-                    [embedding],
-                    dtype=np.float32,
-                )
+                    db.refresh(cache_entry)
 
-                faiss_index.add(vector)
+                    # Add embedding to FAISS
+                    vector = np.array(
+                        [embedding],
+                        dtype=np.float32,
+                    )
 
-                # Maintain FAISS -> database ID mapping
-                cache_ids.append(cache_entry.id)
+                    faiss_index.add(vector)
+
+                    # Maintain FAISS -> database ID mapping
+                    cache_ids.append(cache_entry.id)
 
             finally:
                 db.close()
