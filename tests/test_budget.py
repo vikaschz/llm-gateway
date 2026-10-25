@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -12,6 +13,7 @@ from budget import (
     calculate_actual_cost,
     calculate_budget_period,
     estimate_reservation,
+    get_budget_period_and_ttl,
     get_model_limits,
     get_model_prices,
     validate_max_completion_tokens,
@@ -598,3 +600,27 @@ def test_price_resolution_cannot_represent_sub_nanodollar_prices():
     for prices in MODEL_PRICES_NANODOLLARS.values():
         for price in prices.values():
             assert price >= 1
+
+
+@pytest.mark.asyncio
+async def test_get_budget_period_and_ttl_returns_all_four_values():
+    now = datetime(2026, 10, 31, 19, 0, 0, 500_000, tzinfo=UTC)
+
+    redis_client = AsyncMock()
+    redis_client.time.return_value = (int(now.timestamp()), now.microsecond)
+
+    period_id, ttl, resets_at, expires_at = await get_budget_period_and_ttl(
+        redis_client
+    )
+
+    # One Redis TIME read is the only clock used.
+    redis_client.time.assert_awaited_once()
+
+    assert period_id == "202610"
+    # 5 hours minus 0.5 s rounds up to 5 hours, plus the grace period.
+    assert ttl == 5 * 60 * 60 + BUDGET_TTL_GRACE_SECONDS
+    assert resets_at == "2026-11-01T00:00:00Z"
+    assert expires_at == (
+        int(datetime(2026, 11, 1, tzinfo=UTC).timestamp())
+        + BUDGET_TTL_GRACE_SECONDS
+    )

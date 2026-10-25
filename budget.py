@@ -252,26 +252,9 @@ def calculate_budget_period(
         next_month,
     )
 
-
 async def get_budget_period_and_ttl(
     redis_client,
-) -> tuple[str, int, str]:
-    """
-    Get the current budget period using one Redis TIME call.
-
-    Redis is the authoritative clock for the gateway.
-
-    Returns:
-        period_id:
-            YYYYMM
-
-        ttl:
-            Seconds until the next UTC month plus grace.
-
-        resets_at:
-            ISO-8601 UTC timestamp for the next month boundary.
-    """
-
+) -> tuple[str, int, str, int]:
     seconds, microseconds = await redis_client.time()
 
     now = datetime.fromtimestamp(
@@ -279,8 +262,11 @@ async def get_budget_period_and_ttl(
         tz=UTC,
     )
 
-    period_id, ttl, next_month = (
-        calculate_budget_period(now)
+    period_id, ttl, next_month = calculate_budget_period(now)
+
+    expires_at = (
+        int(next_month.timestamp())
+        + BUDGET_TTL_GRACE_SECONDS
     )
 
     resets_at = (
@@ -289,4 +275,4 @@ async def get_budget_period_and_ttl(
         .replace("+00:00", "Z")
     )
 
-    return period_id, ttl, resets_at
+    return period_id, ttl, resets_at, expires_at
