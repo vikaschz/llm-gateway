@@ -301,3 +301,54 @@ def calculate_rebuild_total(
             )
 
     return total
+
+
+async def get_outstanding_reservations(
+    session: AsyncSession,
+    period_id: str,
+) -> list[tuple[str, int]]:
+    result = await session.execute(
+        select(
+            BudgetReservation.id,
+            BudgetReservation.reserved_amount,
+        )
+        .where(
+            BudgetReservation.period_id == period_id,
+            BudgetReservation.state.in_(["reserved", "uncertain"]),
+        )
+    )
+
+    return [
+        (reservation_id, int(reserved_amount))
+        for reservation_id, reserved_amount in result.all()
+    ]
+
+
+
+
+async def get_rebuild_snapshot(session, period_id: str):
+    result = await session.execute(
+        select(
+            BudgetReservation.id,
+            BudgetReservation.state,
+            BudgetReservation.reserved_amount,
+            BudgetReservation.actual_cost,
+        ).where(
+            BudgetReservation.period_id == period_id,
+            BudgetReservation.state.in_(
+                ["settled", "reserved", "uncertain"]
+            ),
+        )
+    )
+
+    total = 0
+    outstanding = []
+
+    for reservation_id, state, reserved_amount, actual_cost in result:
+        if state == "settled":
+            total += actual_cost or 0
+        else:
+            total += reserved_amount
+            outstanding.append((reservation_id, reserved_amount))
+
+    return total, outstanding
