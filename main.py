@@ -1,23 +1,54 @@
+import logging
+import uuid
 from contextlib import asynccontextmanager
 
 import faiss
 import httpx
-import json
 import numpy as np
-import redis
-import tiktoken
-import time
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from redis.asyncio import Redis as AsyncRedis
 from sentence_transformers import SentenceTransformer
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from budget import (
+    BUDGET_LIMIT_NANODOLLARS,
+    estimate_reservation,
+    get_budget_period_and_ttl,
+    get_model_limits,
+    validate_max_completion_tokens,
+)
 from config import load_api_keys
-from database import Base, engine, SessionLocal
+from database import Base, DATABASE_URL, SessionLocal
 from key_rotation import seed_and_reconcile
 from models import RequestLog, SemanticCache
+from services.budget_accounting import (
+    confirm_reservation,
+    create_pending_reservation,
+    release_reservation,
+)
+from services.budget_redis import (
+    ReserveOutcome,
+    ensure_counter,
+    load_budget_scripts,
+    reserve_budget,
+)
 
+import json
+import logging
+import time
+import uuid
+from contextlib import asynccontextmanager
+
+import faiss
+import httpx
+import numpy as np
+import redis
+import tiktoken
+
+logger = logging.getLogger(__name__)
 # ---------------------------------------------------------
 # Redis connection
 # ---------------------------------------------------------
@@ -51,22 +82,110 @@ with open("rotation_mark_failed.lua", "r") as f:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
-    # Load API key configuration from .env
-    api_key_config = load_api_keys()
+    # -----------------------------------------------------
+    # Async Redis client
+    # -----------------------------------------------------
 
-    # Initialize and reconcile Redis key-rotation state
-    seed_summary = seed_and_reconcile(
-        r,
-        api_key_config,
+    async_redis = AsyncRedis(
+        host="localhost",
+        port=6379,
+        decode_responses=True,
     )
 
-    print("API key rotation initialized:")
-    print(seed_summary)
+    # -----------------------------------------------------
+    # Async SQLAlchemy engine and session factory
+    # -----------------------------------------------------
 
-    # Store configuration on FastAPI application
-    app.state.api_key_config = api_key_config
+    async_database_url = DATABASE_URL.replace(
+        "sqlite:///",
+        "sqlite+aiosqlite:///",
+        1,
+    )
 
-    yield
+    async_engine = create_async_engine(
+        async_database_url,
+    )
+
+    async_session_factory = async_sessionmaker(
+        bind=async_engine,
+        expire_on_commit=False,
+    )
+
+    # Store resources on application state
+    app.state.redis = async_redis
+    app.state.async_engine = async_engine
+    app.state.async_session_factory = async_session_factory
+
+    try:
+
+        # -------------------------------------------------
+        # Register budget model before creating tables
+        # -------------------------------------------------
+
+        from services.budget_reservation import BudgetReservation  # noqa: F401
+
+        # -------------------------------------------------
+        # Create all database tables
+        # -------------------------------------------------
+
+        async with async_engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        # -------------------------------------------------
+        # Load budget Lua scripts
+        # -------------------------------------------------
+
+        app.state.budget_scripts = load_budget_scripts(
+            async_redis
+        )
+
+        # -------------------------------------------------
+        # Rebuild FAISS index after tables exist
+        # -------------------------------------------------
+
+        rebuild_faiss_index()
+
+        # -------------------------------------------------
+        # Load API key configuration
+        # -------------------------------------------------
+
+        api_key_config = load_api_keys()
+
+        # -------------------------------------------------
+        # Initialize key rotation
+        # -------------------------------------------------
+
+        seed_summary = seed_and_reconcile(
+            r,
+            api_key_config,
+        )
+
+        print("API key rotation initialized:")
+        print(seed_summary)
+
+        app.state.api_key_config = api_key_config
+
+        yield
+
+    finally:
+
+        # -------------------------------------------------
+        # Close async Redis client
+        # -------------------------------------------------
+
+        await async_redis.aclose()
+
+        # -------------------------------------------------
+        # Dispose async SQLAlchemy engine
+        # -------------------------------------------------
+
+        await async_engine.dispose()
+
+        # -------------------------------------------------
+        # Close synchronous Redis client
+        # -------------------------------------------------
+
+        r.close()
 
 
 # ---------------------------------------------------------
@@ -101,14 +220,6 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 # ---------------------------------------------------------
 
 MAX_PROVIDER_ATTEMPTS = 3
-
-
-# ---------------------------------------------------------
-# Create database tables
-# ---------------------------------------------------------
-
-Base.metadata.create_all(bind=engine)
-
 
 # ---------------------------------------------------------
 # Semantic cache / FAISS
@@ -169,11 +280,6 @@ faiss_index = faiss.IndexFlatIP(embedding_dimension)
 
 # FAISS vector position -> database/cache ID
 cache_ids = []
-
-
-# Rebuild FAISS index from SQLite
-rebuild_faiss_index()
-
 
 # ---------------------------------------------------------
 # Rate limiter
@@ -460,16 +566,48 @@ async def chat_completion(request: Request):
     # Token reservation
     # -----------------------------------------------------
 
-    padding = PROMPT_OVERHEAD_BASE + (PROMPT_OVERHEAD_PER_MESSAGE * len(messages))
-
-    prompt_tokens_estimate = len(encoding.encode(joined_text)) + padding
+    model_limits = get_model_limits(model)
 
     max_completion_tokens = body.get(
         "max_completion_tokens",
         1024,
     )
 
-    token_reservation = prompt_tokens_estimate + max_completion_tokens
+    if (
+        not isinstance(max_completion_tokens, int)
+        or isinstance(max_completion_tokens, bool)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="max_completion_tokens must be an integer",
+        )
+
+    try:
+        validate_max_completion_tokens(max_completion_tokens)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    if max_completion_tokens > model_limits["max_completion_tokens"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Completion tokens exceed model limit",
+        )
+
+    padding = (
+        PROMPT_OVERHEAD_BASE
+        + PROMPT_OVERHEAD_PER_MESSAGE * len(messages)
+    )
+
+    prompt_tokens_estimate = (
+        len(encoding.encode(joined_text)) + padding
+    )
+
+    token_reservation = (
+        prompt_tokens_estimate + max_completion_tokens
+    )
 
     print(
         f"reservation={token_reservation} "
@@ -599,6 +737,94 @@ async def chat_completion(request: Request):
                 status_code=503,
                 detail="Selected API key is unavailable",
             )
+
+        # -------------------------------------------------
+        # Monthly budget reservation
+        # -------------------------------------------------
+
+        reservation_id = str(uuid.uuid4())
+        request_id = str(uuid.uuid4())
+
+        async_redis = request.app.state.redis
+        session_factory = request.app.state.async_session_factory
+
+        estimated_cost = estimate_reservation(
+            model,
+            prompt_tokens_estimate,
+            max_completion_tokens,
+        )
+
+        period_id, ttl, resets_at, expires_at = (
+            await get_budget_period_and_ttl(async_redis)
+        )
+
+        async with session_factory() as session:
+
+            # Create pending database record first.
+            await create_pending_reservation(
+                session=session,
+                reservation_id=reservation_id,
+                request_id=request_id,
+                period_id=period_id,
+                model=model,
+                reserved_amount=estimated_cost,
+                key_id=key_id,
+            )
+
+            await session.commit()
+
+            # Ensure the monthly Redis counter is initialized.
+            await ensure_counter(
+                redis=async_redis,
+                session=session,
+                period_id=period_id,
+                expires_at=expires_at,
+            )
+
+            # Atomically reserve estimated monetary cost.
+            budget_result = await reserve_budget(
+                redis=async_redis,
+                period_id=period_id,
+                reservation_id=reservation_id,
+                amount=estimated_cost,
+                limit=BUDGET_LIMIT_NANODOLLARS,
+            )
+
+            if budget_result.outcome not in (
+                ReserveOutcome.ACCEPTED,
+                ReserveOutcome.ALREADY_RESERVED,
+            ):
+
+                await release_reservation(
+                    session,
+                    reservation_id,
+                    release_reason="budget_exceeded",
+                )
+
+                await session.commit()
+
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "error": "Monthly budget reservation rejected",
+                        "budget_period": period_id,
+                        "budget_resets_at": resets_at,
+                    },
+                )
+
+            # Redis reservation accepted.
+            transition_result = await confirm_reservation(
+                session,
+                reservation_id,
+            )
+
+            if not transition_result.changed:
+                raise RuntimeError(
+                    "Redis accepted budget reservation, "
+                    "but database confirmation failed"
+                )
+
+            await session.commit()
 
         print(f"Using API key: {key_id}")
 
@@ -974,13 +1200,4 @@ async def chat_completion(request: Request):
     raise HTTPException(
         status_code=503,
         detail="Provider request failed",
-    )
-
-
-@app.get("/test-headers")
-async def test_headers():
-    raise HTTPException(
-        status_code=503,
-        detail="test",
-        headers={"Retry-After": "42"},
     )
