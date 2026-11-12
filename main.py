@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from budget import (
     BUDGET_LIMIT_NANODOLLARS,
+    DEFAULT_MAX_COMPLETION_TOKENS,
     estimate_reservation,
     get_budget_period_and_ttl,
     get_model_limits,
@@ -58,7 +59,6 @@ r = redis.Redis(
     port=6379,
     decode_responses=True,
 )
-
 
 # ---------------------------------------------------------
 # Key rotation Lua scripts
@@ -448,6 +448,75 @@ async def chat_completion(request: Request):
     api_key_config = request.app.state.api_key_config
 
     # -----------------------------------------------------
+    # Model validation
+    # -----------------------------------------------------
+
+    model = body.get("model")
+
+    if model not in api_key_config.keys_by_model:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{model}' is not configured",
+        )
+
+    try:
+        model_limits = get_model_limits(model)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    # -----------------------------------------------------
+    # Completion-token validation
+    # -----------------------------------------------------
+
+    # Modern parameter takes precedence over legacy parameter.
+    if "max_completion_tokens" in body:
+        max_completion_tokens = body["max_completion_tokens"]
+
+    elif "max_tokens" in body:
+        max_completion_tokens = body["max_tokens"]
+
+    else:
+        max_completion_tokens = DEFAULT_MAX_COMPLETION_TOKENS
+
+    # Validate integer type.
+    # bool is also an int subclass in Python.
+    if (
+        not isinstance(max_completion_tokens, int)
+        or isinstance(max_completion_tokens, bool)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="max_completion_tokens must be an integer",
+        )
+
+    # Validate gateway completion cap.
+    try:
+        validate_max_completion_tokens(max_completion_tokens)
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    # Validate model-specific completion limit.
+    if max_completion_tokens > model_limits["max_completion_tokens"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Completion tokens exceed model limit",
+        )
+
+    # Normalize request body.
+    # The provider receives exactly the limit used
+    # for budget estimation.
+    body.pop("max_tokens", None)
+
+    body["max_completion_tokens"] = max_completion_tokens
+
+    # -----------------------------------------------------
     # Extract messages
     # -----------------------------------------------------
 
@@ -550,52 +619,10 @@ async def chat_completion(request: Request):
             db.close()
 
     # -----------------------------------------------------
-    # Model validation
-    # -----------------------------------------------------
-
-    model = body.get("model")
-
-    if model not in api_key_config.keys_by_model:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(f"Model '{model}' " "is not configured"),
-        )
-
-    # -----------------------------------------------------
     # Token reservation
     # -----------------------------------------------------
 
-    model_limits = get_model_limits(model)
-
-    max_completion_tokens = body.get(
-        "max_completion_tokens",
-        1024,
-    )
-
-    if (
-        not isinstance(max_completion_tokens, int)
-        or isinstance(max_completion_tokens, bool)
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="max_completion_tokens must be an integer",
-        )
-
-    try:
-        validate_max_completion_tokens(max_completion_tokens)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        ) from exc
-
-    if max_completion_tokens > model_limits["max_completion_tokens"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Completion tokens exceed model limit",
-        )
-
+    # Estimate prompt tokens.
     padding = (
         PROMPT_OVERHEAD_BASE
         + PROMPT_OVERHEAD_PER_MESSAGE * len(messages)
@@ -605,6 +632,7 @@ async def chat_completion(request: Request):
         len(encoding.encode(joined_text)) + padding
     )
 
+    # Reserve prompt + maximum completion tokens.
     token_reservation = (
         prompt_tokens_estimate + max_completion_tokens
     )

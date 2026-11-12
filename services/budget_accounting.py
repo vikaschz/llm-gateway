@@ -24,11 +24,7 @@ class TransitionResult:
 def _allowed_source_states(
     target_state: str,
 ) -> set[str]:
-    return {
-        source
-        for source, target in LEGAL_TRANSITIONS
-        if target == target_state
-    }
+    return {source for source, target in LEGAL_TRANSITIONS if target == target_state}
 
 
 async def create_pending_reservation(
@@ -43,19 +39,13 @@ async def create_pending_reservation(
 ) -> BudgetReservation:
 
     if not isinstance(period_id, str) or len(period_id) != 6:
-        raise ValueError(
-            "period_id must use YYYYMM format"
-        )
+        raise ValueError("period_id must use YYYYMM format")
 
     if not period_id.isdigit():
-        raise ValueError(
-            "period_id must use YYYYMM format"
-        )
+        raise ValueError("period_id must use YYYYMM format")
 
     if reserved_amount <= 0:
-        raise ValueError(
-            "Budget reservation must be greater than zero"
-        )
+        raise ValueError("Budget reservation must be greater than zero")
 
     now = utc_now()
 
@@ -87,13 +77,8 @@ async def transition_reservation(
     release_reason: str | None = None,
 ) -> TransitionResult:
 
-    if target_state not in {
-        target
-        for _, target in LEGAL_TRANSITIONS
-    }:
-        raise ValueError(
-            f"Unsupported target state: {target_state}"
-        )
+    if target_state not in {target for _, target in LEGAL_TRANSITIONS}:
+        raise ValueError(f"Unsupported target state: {target_state}")
 
     values = {
         "state": target_state,
@@ -105,39 +90,27 @@ async def transition_reservation(
 
     if target_state == "settled":
         if actual_cost is None or actual_cost < 0:
-            raise ValueError(
-                "Settlement requires a non-negative actual_cost"
-            )
+            raise ValueError("Settlement requires a non-negative actual_cost")
 
         values["actual_cost"] = actual_cost
         values["settled_at"] = utc_now()
 
     elif actual_cost is not None:
-        raise ValueError(
-            "actual_cost can only be set during settlement"
-        )
+        raise ValueError("actual_cost can only be set during settlement")
 
     if target_state == "released":
         if not release_reason or not release_reason.strip():
-            raise ValueError(
-                "Release requires a non-empty reason"
-            )
+            raise ValueError("Release requires a non-empty reason")
 
         values["release_reason"] = release_reason
 
     elif release_reason is not None:
-        raise ValueError(
-            "release_reason can only be set during release"
-        )
+        raise ValueError("release_reason can only be set during release")
 
-    allowed_sources = _allowed_source_states(
-        target_state
-    )
+    allowed_sources = _allowed_source_states(target_state)
 
     if not allowed_sources:
-        raise ValueError(
-            f"No legal transitions to {target_state}"
-        )
+        raise ValueError(f"No legal transitions to {target_state}")
 
     result = await session.execute(
         update(BudgetReservation)
@@ -146,9 +119,7 @@ async def transition_reservation(
             BudgetReservation.state.in_(allowed_sources),
         )
         .values(**values)
-        .execution_options(     
-            synchronize_session=False
-        )
+        .execution_options(synchronize_session=False)
     )
 
     if result.rowcount == 1:
@@ -159,9 +130,7 @@ async def transition_reservation(
         )
 
     current_state = await session.scalar(
-        select(BudgetReservation.state).where(
-            BudgetReservation.id == reservation_id
-        )
+        select(BudgetReservation.state).where(BudgetReservation.id == reservation_id)
     )
 
     if current_state is None:
@@ -244,8 +213,16 @@ async def get_rebuild_total(
         func.coalesce(
             func.sum(
                 case(
-                    (BudgetReservation.state == "settled", BudgetReservation.actual_cost),
-                    (BudgetReservation.state.in_(["reserved", "uncertain"]), BudgetReservation.reserved_amount),
+                    (
+                        BudgetReservation.state == "settled",
+                        BudgetReservation.actual_cost,
+                    ),
+                    (
+                        BudgetReservation.state.in_(
+                            ["pending", "reserved", "uncertain"]
+                        ),
+                        BudgetReservation.reserved_amount,
+                    ),
                     else_=0,
                 )
             ),
@@ -257,48 +234,39 @@ async def get_rebuild_total(
     return int(result.scalar_one())
 
 
-def calculate_rebuild_total(
-    reservations,
-) -> int:
+def calculate_rebuild_total(reservations) -> int:
     """
     Reference implementation for rebuild accounting.
 
-    settled             -> actual_cost
-    reserved/uncertain  -> reserved_amount
-    pending/released    -> zero
+    settled                     -> actual_cost
+    pending/reserved/uncertain  -> reserved_amount
+    released                    -> zero
     """
 
     total = 0
 
     for reservation in reservations:
 
-        if reservation.state in {
-            "pending",
-            "released",
-        }:
+        if reservation.state == "released":
             continue
 
         if reservation.state == "settled":
-
             if reservation.actual_cost is None:
                 raise ValueError(
-                    f"Settled reservation {reservation.id} "
-                    "has no actual_cost"
+                    f"Settled reservation {reservation.id} " "has no actual_cost"
                 )
 
             total += reservation.actual_cost
 
         elif reservation.state in {
+            "pending",
             "reserved",
             "uncertain",
         }:
             total += reservation.reserved_amount
 
         else:
-            raise ValueError(
-                f"Unknown reservation state: "
-                f"{reservation.state}"
-            )
+            raise ValueError(f"Unknown reservation state: {reservation.state}")
 
     return total
 
@@ -311,10 +279,9 @@ async def get_outstanding_reservations(
         select(
             BudgetReservation.id,
             BudgetReservation.reserved_amount,
-        )
-        .where(
+        ).where(
             BudgetReservation.period_id == period_id,
-            BudgetReservation.state.in_(["reserved", "uncertain"]),
+            BudgetReservation.state.in_(["pending", "reserved", "uncertain"]),
         )
     )
 
@@ -324,9 +291,10 @@ async def get_outstanding_reservations(
     ]
 
 
-
-
-async def get_rebuild_snapshot(session, period_id: str):
+async def get_rebuild_snapshot(
+    session: AsyncSession,
+    period_id: str,
+):
     result = await session.execute(
         select(
             BudgetReservation.id,
@@ -336,7 +304,7 @@ async def get_rebuild_snapshot(session, period_id: str):
         ).where(
             BudgetReservation.period_id == period_id,
             BudgetReservation.state.in_(
-                ["settled", "reserved", "uncertain"]
+                ["settled", "pending", "reserved", "uncertain"]
             ),
         )
     )
@@ -345,8 +313,15 @@ async def get_rebuild_snapshot(session, period_id: str):
     outstanding = []
 
     for reservation_id, state, reserved_amount, actual_cost in result:
+
         if state == "settled":
-            total += actual_cost or 0
+            if actual_cost is None:
+                raise ValueError(
+                    f"Settled reservation {reservation_id} " "has no actual_cost"
+                )
+
+            total += actual_cost
+
         else:
             total += reserved_amount
             outstanding.append((reservation_id, reserved_amount))

@@ -85,6 +85,27 @@ def test_reserve_requires_recovery_when_counter_missing(
     assert redis_client.exists(marker) == 0
 
 
+def test_reserve_requires_recovery_when_counter_missing_with_marker(
+    redis_client, reserve_script, counter_key, marker_key
+):
+    period = "202610"
+    reservation_id = "reservation-with-missing-counter"
+
+    counter = counter_key(period)
+    marker = marker_key(period, reservation_id)
+    redis_client.set(marker, 50, ex=3600)
+
+    result = reserve_script(
+        keys=[counter, marker],
+        args=[50, 1000],
+    )
+
+    assert result[0] == RECOVERY_REQUIRED
+    assert result[1] == "recovery_required"
+    assert redis_client.exists(counter) == 0
+    assert redis_client.get(marker) == "50"
+
+
 def test_reserve_rejects_corrupt_counter(
     redis_client, reserve_script, counter_key, marker_key
 ):

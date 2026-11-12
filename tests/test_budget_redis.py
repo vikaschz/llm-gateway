@@ -491,11 +491,12 @@ async def test_ensure_counter_rebuilds_from_real_database(
 
     assert published is True
 
-    assert await async_redis_client.get(budget.counter_key(period_id)) == "175"
+    assert await async_redis_client.get(budget.counter_key(period_id)) == "225"
 
     expected_markers = {
         budget.marker_key(period_id, "reserved-current"): "80",
         budget.marker_key(period_id, "uncertain-current"): "60",
+        budget.marker_key(period_id, "pending-current"): "50",
     }
 
     for key, expected_value in expected_markers.items():
@@ -564,16 +565,22 @@ async def test_ensure_counter_rebuilds_from_real_database_rows(
 
     assert published is True
 
-    # settled 35 + reserved 80 + uncertain 60; pending and released count zero.
-    assert await async_redis_client.get(budget.counter_key(period)) == "175"
+    # settled 35 + reserved 80 + uncertain 60 + pending 50.
+    # Released reservations count zero.
+
+    assert await async_redis_client.get(budget.counter_key(period)) == "225"
 
     markers = set(await async_redis_client.keys(f"budget:marker:{period}:*"))
+
     assert markers == {
         budget.marker_key(period, "reserved-1"),
         budget.marker_key(period, "uncertain-1"),
+        budget.marker_key(period, "pending-1"),
     }
     assert await async_redis_client.get(budget.marker_key(period, "reserved-1")) == "80"
-    assert await async_redis_client.get(budget.marker_key(period, "uncertain-1")) == "60"
+    assert (
+        await async_redis_client.get(budget.marker_key(period, "uncertain-1")) == "60"
+    )
 
     # The other month was never touched.
     assert await async_redis_client.exists(budget.counter_key("202609")) == 0

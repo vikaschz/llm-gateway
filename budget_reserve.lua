@@ -57,7 +57,32 @@ if not reservation_num or reservation_num <= 0
     return {-1, "invalid_arguments"}
 end
 
--- 2. Check the idempotency marker before inspecting the counter.
+-- 2. A missing counter requires recovery. Do not write anything.
+local current_raw = redis.call("GET", counter_key)
+
+if not current_raw then
+    return {3, "recovery_required"}
+end
+
+-- 3. Reject corrupt counters.
+local current = parse_integer(current_raw)
+
+if not current then
+    return {4, "corrupt"}
+end
+
+-- 4. Validate counter TTL.
+local pttl = redis.call("PTTL", counter_key)
+
+if pttl == -1 then
+    return {7, "no_ttl"}
+end
+
+if pttl <= 0 then
+    return {3, "recovery_required"}
+end
+
+-- 5. Check idempotency marker.
 local existing_marker = redis.call("GET", marker_key)
 
 if existing_marker then
@@ -70,21 +95,7 @@ if existing_marker then
     return {2, "already_reserved"}
 end
 
--- 3. A missing counter requires recovery. Do not write anything.
-local current_raw = redis.call("GET", counter_key)
-
-if not current_raw then
-    return {3, "recovery_required"}
-end
-
--- 4. Reject corrupt counters.
-local current = parse_integer(current_raw)
-
-if not current then
-    return {4, "corrupt"}
-end
-
--- 5. Reject reservations larger than the entire budget.
+-- 6. Reject reservations larger than the entire budget.
 if reservation_num > limit_num then
     return {
         5,
@@ -106,17 +117,6 @@ if current > limit_num
         limit_num,
         math.max(0, limit_num - current)
     }
-end
-
--- 6. Use the counter's remaining TTL for the marker.
-local pttl = redis.call("PTTL", counter_key)
-
-if pttl == -1 then
-    return {7, "no_ttl"}
-end
-
-if pttl <= 0 then
-    return {3, "recovery_required"}
 end
 
 -- 7. Update the counter and create the marker.

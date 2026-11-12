@@ -176,7 +176,7 @@ async def test_concurrent_settlement_changes_once(session_factory):
 
 
 @pytest.mark.asyncio
-async def test_rebuild_total_counts_only_billable_states_in_period(session_factory):
+async def test_rebuild_total_counts_pending_and_billable_states_in_period(session_factory):
     async with session_factory() as session:
         await add_reservation(session, "settled", state="settled", reserved_amount=100, actual_cost=35)
         await add_reservation(session, "reserved", state="reserved", reserved_amount=80)
@@ -192,7 +192,7 @@ async def test_rebuild_total_counts_only_billable_states_in_period(session_facto
             select(BudgetReservation).where(BudgetReservation.period_id == "202610")
         )).all())
 
-    assert total == 175
+    assert total == 225
     assert total == calculate_rebuild_total(period_rows)
     rows = {row.id: row for row in period_rows}
     assert rows["settled"].actual_cost == 35
