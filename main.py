@@ -824,10 +824,10 @@ async def chat_completion(request: Request):
             ):
 
                 await release_reservation(
-                    session,
-                    reservation_id,
-                    release_reason="budget_exceeded",
-                )
+    session,
+    reservation_id,
+    "budget_exceeded",
+)
 
                 await session.commit()
 
