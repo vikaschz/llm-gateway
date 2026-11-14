@@ -678,8 +678,8 @@ async def chat_completion(request: Request):
     # Provider request / key rotation
     # -----------------------------------------------------
 
+    request_id = str(uuid.uuid4())
     for attempt in range(MAX_PROVIDER_ATTEMPTS):
-
         print(f"Provider attempt " f"{attempt + 1}/" f"{MAX_PROVIDER_ATTEMPTS}")
 
         # -------------------------------------------------
@@ -771,7 +771,6 @@ async def chat_completion(request: Request):
         # -------------------------------------------------
 
         reservation_id = str(uuid.uuid4())
-        request_id = str(uuid.uuid4())
 
         async_redis = request.app.state.redis
         session_factory = request.app.state.async_session_factory
@@ -809,7 +808,7 @@ async def chat_completion(request: Request):
                 expires_at=expires_at,
             )
 
-            # Atomically reserve estimated monetary cost.
+            # Attempt the Redis budget reservation.
             budget_result = await reserve_budget(
                 redis=async_redis,
                 period_id=period_id,
@@ -818,29 +817,88 @@ async def chat_completion(request: Request):
                 limit=BUDGET_LIMIT_NANODOLLARS,
             )
 
+            # -------------------------------------------------
+            # Recovery required
+            # -------------------------------------------------
+
+            recovery_retry = False
+
+            if budget_result.outcome == ReserveOutcome.RECOVERY_REQUIRED:
+
+                recovery_retry = True
+
+                # Rebuild the Redis counter from SQL.
+                await ensure_counter(
+                    redis=async_redis,
+                    session=session,
+                    period_id=period_id,
+                    expires_at=expires_at,
+                )
+
+                # Retry the reservation exactly once.
+                budget_result = await reserve_budget(
+                    redis=async_redis,
+                    period_id=period_id,
+                    reservation_id=reservation_id,
+                    amount=estimated_cost,
+                    limit=BUDGET_LIMIT_NANODOLLARS,
+                )
+
+            # -------------------------------------------------
+            # Reservation rejected / failed
+            # -------------------------------------------------
+
             if budget_result.outcome not in (
                 ReserveOutcome.ACCEPTED,
                 ReserveOutcome.ALREADY_RESERVED,
             ):
 
+                if budget_result.outcome == ReserveOutcome.EXCEEDED:
+                    release_reason = "budget_exceeded"
+                elif recovery_retry:
+                    release_reason = "budget_recovery_failed"
+                else:
+                    release_reason = "budget_reservation_failed"
+
                 await release_reservation(
-    session,
-    reservation_id,
-    "budget_exceeded",
-)
+                    session,
+                    reservation_id,
+                    release_reason,
+                )
 
                 await session.commit()
 
+                # Return the global rate-limit token reservation.
+                rollback_global_token_reservation(token_reservation)
+
+                # First-attempt budget exhaustion gets HTTP 402.
+                if (
+                    budget_result.outcome == ReserveOutcome.EXCEEDED
+                    and not recovery_retry
+                ):
+                    raise HTTPException(
+                        status_code=402,
+                        detail={
+                            "error": "Monthly budget exceeded",
+                            "budget_period": period_id,
+                            "budget_resets_at": resets_at,
+                        },
+                    )
+
+                # Recovery failure and other Redis errors fail closed.
                 raise HTTPException(
-                    status_code=429,
+                    status_code=503,
                     detail={
-                        "error": "Monthly budget reservation rejected",
+                        "error": "Monthly budget reservation failed",
                         "budget_period": period_id,
                         "budget_resets_at": resets_at,
                     },
                 )
 
-            # Redis reservation accepted.
+            # -------------------------------------------------
+            # Redis accepted the reservation
+            # -------------------------------------------------
+
             transition_result = await confirm_reservation(
                 session,
                 reservation_id,
